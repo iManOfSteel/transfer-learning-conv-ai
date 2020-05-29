@@ -87,6 +87,99 @@ def sample_sequence(personality, history, tokenizer, model, args, current_output
 
     return current_output
 
+
+def sample_sequence_dict(personality, history, tokenizer, model, args, current_output=None):
+    special_tokens_ids = tokenizer.convert_tokens_to_ids(SPECIAL_TOKENS)
+    if current_output is None:
+        current_output = []
+
+    for i in range(args['max_length']):
+        instance = build_input_from_segments(personality, history, current_output, tokenizer, with_eos=False)
+
+        input_ids = torch.tensor(instance["input_ids"], device=args['device']).unsqueeze(0)
+        token_type_ids = torch.tensor(instance["token_type_ids"], device=args['device']).unsqueeze(0)
+
+        logits = model(input_ids, token_type_ids=token_type_ids)
+        if isinstance(logits, tuple):  # for gpt2 and maybe others
+            logits = logits[0]
+        logits = logits[0, -1, :] / args['temperature']
+        logits = top_filtering(logits, top_k=args['top_k'], top_p=args['top_p'])
+        probs = F.softmax(logits, dim=-1)
+
+        prev = torch.topk(probs, 1)[1] if args['no_sample'] else torch.multinomial(probs, 1)
+        if i < args['min_length'] and prev.item() in special_tokens_ids:
+            while prev.item() in special_tokens_ids:
+                if probs.max().item() == 1:
+                    warnings.warn("Warning: model generating special token with probability 1.")
+                    break  # avoid infinitely looping over special token
+                prev = torch.multinomial(probs, num_samples=1)
+
+        if prev.item() in special_tokens_ids:
+            break
+        current_output.append(prev.item())
+
+    return current_output
+
+
+default_args = dict(
+    max_history=4,
+    no_sample="store_true",
+    max_length=20,
+    min_length=1,
+    temperature=0.7,
+    top_k=0,
+    top_p=0.9
+)
+
+
+def get_model(
+        dataset_path="",
+        dataset_cache='./dataset_cache',
+        model="openai-gpt",
+        model_checkpoint="",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        seed=0,
+):
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__file__)
+
+    if model_checkpoint == "":
+        if model == 'gpt2':
+            raise ValueError("Interacting with GPT2 requires passing a finetuned model_checkpoint")
+        else:
+            model_checkpoint = download_pretrained_model()
+
+    if seed != 0:
+        random.seed(seed)
+        torch.random.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+    logger.info("Get pretrained model and tokenizer")
+    tokenizer_class, model_class = (GPT2Tokenizer, GPT2LMHeadModel) if model == 'gpt2' else (OpenAIGPTTokenizer, OpenAIGPTLMHeadModel)
+    tokenizer = tokenizer_class.from_pretrained(model_checkpoint)
+    model = model_class.from_pretrained(model_checkpoint)
+    model.to(device)
+    add_special_tokens_(model, tokenizer)
+
+    logger.info("Sample a personality")
+    dataset = get_dataset(tokenizer, dataset_path, dataset_cache)
+    personalities = [dialog["personality"] for dataset in dataset.values() for dialog in dataset]
+    personality = random.choice(personalities)
+    logger.info("Selected personality: %s", tokenizer.decode(chain(*personality)))
+    return model, personality, tokenizer
+
+
+def get_answer(model, personality, tokenizer, raw_history, raw_text, args=default_args):
+    history = [tokenizer.encode(sent) for sent in raw_history]
+    history = history[-(2 * args['max_history'] + 1):]
+
+    history.append(tokenizer.encode(raw_text))
+    with torch.no_grad():
+        out_ids = sample_sequence_dict(personality, history, tokenizer, model, args)
+    out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
+    return out_text
+
+
 def run():
     parser = ArgumentParser()
     parser.add_argument("--dataset_path", type=str, default="", help="Path or url of the dataset. If empty download from S3.")
